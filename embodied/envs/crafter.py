@@ -9,9 +9,10 @@ import numpy as np
 class Crafter(embodied.Env):
   """Crafter adapter with optional score-aligned achievement rewards.
 
-  After the warm-up episodes, achievement weights are proportional to
-  ``1 / (epsilon + success_rate)`` and then normalized and clipped. The reward
-  stored in replay is
+  Every ``achievement_update_interval`` completed episodes, achievement
+  weights are recomputed from that block's success rates. Weights are
+  proportional to ``1 / (epsilon + success_rate)`` and then normalized and
+  clipped. The reward stored in replay is
 
     train_reward = env_reward + scale * sum((weight_i - 1) * unlock_i).
 
@@ -23,14 +24,19 @@ class Crafter(embodied.Env):
       achievement_reweight=False, achievement_scale=1.0,
       achievement_warmup=100, achievement_epsilon=0.01,
       achievement_weight_min=0.5, achievement_weight_max=2.0,
-      achievement_freeze=True):
+      achievement_freeze=None, achievement_update_interval=None):
     assert task in ('reward', 'noreward')
     assert not achievement_reweight or task == 'reward', (
         'Achievement reweighting requires task="reward".')
     assert achievement_scale >= 0
-    assert achievement_warmup >= 0
+    assert achievement_warmup > 0
     assert achievement_epsilon > 0
     assert 0 < achievement_weight_min <= achievement_weight_max
+    achievement_update_interval = (
+        achievement_warmup
+        if achievement_update_interval is None
+        else achievement_update_interval)
+    assert achievement_update_interval > 0
     self._env = crafter.Env(size=size, reward=(task == 'reward'), seed=seed)
     self._logs = logs
     self._logdir = logdir and elements.Path(logdir)
@@ -42,17 +48,25 @@ class Crafter(embodied.Env):
     self._achievements = crafter.constants.achievements.copy()
     self._achievement_reweight = achievement_reweight
     self._achievement_scale = float(achievement_scale)
-    self._achievement_warmup = int(achievement_warmup)
+    # ``achievement_warmup`` is kept as a backward-compatible name for the
+    # first 100-episode block. The new method uses the same-sized blocks for
+    # every later update as well.
+    self._achievement_update_interval = int(achievement_update_interval)
     self._achievement_epsilon = float(achievement_epsilon)
     self._achievement_weight_min = float(achievement_weight_min)
     self._achievement_weight_max = float(achievement_weight_max)
-    self._achievement_freeze = achievement_freeze
-    self._weights_frozen = False
+    # Kept only so older configs that pass achievement_freeze still load. The
+    # periodic method intentionally never freezes the weights.
+    del achievement_freeze
     self._completed_episodes = 0
     self._achievement_successes = {
         name: 0 for name in self._achievements}
+    self._window_episodes = 0
+    self._window_achievement_successes = {
+        name: 0 for name in self._achievements}
     self._achievement_weights = {
         name: 1.0 for name in self._achievements}
+    self._weight_updates = 0
     self._previous_achievements = {
         name: 0 for name in self._achievements}
     self._restore_stats()
@@ -134,17 +148,20 @@ class Crafter(embodied.Env):
 
   def _finish_episode(self, achievements):
     self._completed_episodes += 1
+    self._window_episodes += 1
     for name in self._achievements:
-      self._achievement_successes[name] += int(achievements[name] > 0)
+      success = int(achievements[name] > 0)
+      self._achievement_successes[name] += success
+      self._window_achievement_successes[name] += success
     self._update_achievement_weights()
 
   def _update_achievement_weights(self):
     if (
-        not self._achievement_reweight or self._weights_frozen or
-        self._completed_episodes < self._achievement_warmup):
+        not self._achievement_reweight or
+        self._window_episodes < self._achievement_update_interval):
       return
     rates = np.array([
-        self._achievement_successes[name] / self._completed_episodes
+        self._window_achievement_successes[name] / self._window_episodes
         for name in self._achievements
     ], np.float64)
     weights = 1.0 / (self._achievement_epsilon + rates)
@@ -156,8 +173,10 @@ class Crafter(embodied.Env):
     self._achievement_weights = {
         name: float(weight)
         for name, weight in zip(self._achievements, weights)}
-    if self._achievement_freeze:
-      self._weights_frozen = True
+    self._weight_updates += 1
+    self._window_episodes = 0
+    self._window_achievement_successes = {
+        name: 0 for name in self._achievements}
 
   def _restore_stats(self):
     if not self._logdir:
@@ -175,9 +194,11 @@ class Crafter(embodied.Env):
         continue
       self._episode = max(self._episode, int(stats.get('episode', 0)))
       self._completed_episodes += 1
+      self._window_episodes += 1
       for name in self._achievements:
-        self._achievement_successes[name] += int(
-            stats[f'achievement_{name}'] > 0)
+        success = int(stats[f'achievement_{name}'] > 0)
+        self._achievement_successes[name] += success
+        self._window_achievement_successes[name] += success
       self._update_achievement_weights()
     if self._completed_episodes:
       print(
@@ -214,6 +235,8 @@ class Crafter(embodied.Env):
         'reward': round(reward, 1),
         'train_reward': round(train_reward, 3),
         'achievement_reweight': self._achievement_reweight,
+        'achievement_weight_updates': self._weight_updates,
+        'achievement_update_interval': self._achievement_update_interval,
         **{f'achievement_{k}': v for k, v in info['achievements'].items()},
         **{
             f'achievement_success_rate_{k}': round(
@@ -221,6 +244,10 @@ class Crafter(embodied.Env):
             for k in self._achievements},
         **{
             f'achievement_weight_{k}': round(weights_used[k], 6)
+            for k in self._achievements},
+        **{
+            f'achievement_next_weight_{k}': round(
+                self._achievement_weights[k], 6)
             for k in self._achievements},
     }
     filename = self._logdir / 'stats.jsonl'
