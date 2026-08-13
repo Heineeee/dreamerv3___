@@ -7,9 +7,30 @@ import numpy as np
 
 
 class Crafter(embodied.Env):
+  """Crafter adapter with optional score-aligned achievement rewards.
 
-  def __init__(self, task, size=(64, 64), logs=False, logdir=None, seed=None):
+  After the warm-up episodes, achievement weights are proportional to
+  ``1 / (epsilon + success_rate)`` and then normalized and clipped. The reward
+  stored in replay is
+
+    train_reward = env_reward + scale * sum((weight_i - 1) * unlock_i).
+
+  The original environment reward and achievements remain available as logs.
+  """
+
+  def __init__(
+      self, task, size=(64, 64), logs=False, logdir=None, seed=None,
+      achievement_reweight=False, achievement_scale=1.0,
+      achievement_warmup=100, achievement_epsilon=0.01,
+      achievement_weight_min=0.5, achievement_weight_max=2.0,
+      achievement_freeze=True):
     assert task in ('reward', 'noreward')
+    assert not achievement_reweight or task == 'reward', (
+        'Achievement reweighting requires task="reward".')
+    assert achievement_scale >= 0
+    assert achievement_warmup >= 0
+    assert achievement_epsilon > 0
+    assert 0 < achievement_weight_min <= achievement_weight_max
     self._env = crafter.Env(size=size, reward=(task == 'reward'), seed=seed)
     self._logs = logs
     self._logdir = logdir and elements.Path(logdir)
@@ -17,7 +38,24 @@ class Crafter(embodied.Env):
     self._episode = 0
     self._length = None
     self._reward = None
+    self._train_reward = None
     self._achievements = crafter.constants.achievements.copy()
+    self._achievement_reweight = achievement_reweight
+    self._achievement_scale = float(achievement_scale)
+    self._achievement_warmup = int(achievement_warmup)
+    self._achievement_epsilon = float(achievement_epsilon)
+    self._achievement_weight_min = float(achievement_weight_min)
+    self._achievement_weight_max = float(achievement_weight_max)
+    self._achievement_freeze = achievement_freeze
+    self._weights_frozen = False
+    self._completed_episodes = 0
+    self._achievement_successes = {
+        name: 0 for name in self._achievements}
+    self._achievement_weights = {
+        name: 1.0 for name in self._achievements}
+    self._previous_achievements = {
+        name: 0 for name in self._achievements}
+    self._restore_stats()
     self._done = True
 
   @property
@@ -29,6 +67,7 @@ class Crafter(embodied.Env):
         'is_last': elements.Space(bool),
         'is_terminal': elements.Space(bool),
         'log/reward': elements.Space(np.float32),
+        'log/train_reward': elements.Space(np.float32),
     }
     if self._logs:
       spaces.update({
@@ -47,30 +86,119 @@ class Crafter(embodied.Env):
     if action['reset'] or self._done:
       self._episode += 1
       self._length = 0
-      self._reward = 0
+      self._reward = 0.0
+      self._train_reward = 0.0
+      self._previous_achievements = {
+          name: 0 for name in self._achievements}
       self._done = False
       image = self._env.reset()
-      return self._obs(image, 0.0, {}, is_first=True)
+      return self._obs(image, 0.0, {}, raw_reward=0.0, is_first=True)
     image, reward, self._done, info = self._env.step(action['action'])
-    self._reward += reward
+    raw_reward = float(reward)
+    newly_unlocked = self._newly_unlocked(info['achievements'])
+    train_reward = self._reweight_reward(raw_reward, newly_unlocked)
+    self._reward += raw_reward
+    self._train_reward += train_reward
     self._length += 1
-    if self._done and self._logdir:
-      self._write_stats(self._length, self._reward, info)
+    if self._done:
+      weights_used = self._achievement_weights.copy()
+      self._finish_episode(info['achievements'])
+      if self._logdir:
+        self._write_stats(
+            self._length, self._reward, self._train_reward, info,
+            weights_used)
     return self._obs(
-        image, reward, info,
+        image, train_reward, info, raw_reward=raw_reward,
         is_last=self._done,
         is_terminal=info['discount'] == 0)
 
+  def _newly_unlocked(self, achievements):
+    # Achievement counters can increase repeatedly within an episode. Crafter's
+    # sparse reward and score only care about the first unlock in each episode.
+    unlocked = {
+        name: int(
+            self._previous_achievements[name] == 0 and
+            achievements[name] > 0)
+        for name in self._achievements}
+    self._previous_achievements = {
+        name: achievements[name] for name in self._achievements}
+    return unlocked
+
+  def _reweight_reward(self, reward, newly_unlocked):
+    if not self._achievement_reweight:
+      return reward
+    bonus = sum(
+        (self._achievement_weights[name] - 1.0) * unlocked
+        for name, unlocked in newly_unlocked.items())
+    return reward + self._achievement_scale * bonus
+
+  def _finish_episode(self, achievements):
+    self._completed_episodes += 1
+    for name in self._achievements:
+      self._achievement_successes[name] += int(achievements[name] > 0)
+    self._update_achievement_weights()
+
+  def _update_achievement_weights(self):
+    if (
+        not self._achievement_reweight or self._weights_frozen or
+        self._completed_episodes < self._achievement_warmup):
+      return
+    rates = np.array([
+        self._achievement_successes[name] / self._completed_episodes
+        for name in self._achievements
+    ], np.float64)
+    weights = 1.0 / (self._achievement_epsilon + rates)
+    weights /= weights.mean()
+    weights = np.clip(
+        weights,
+        self._achievement_weight_min,
+        self._achievement_weight_max)
+    self._achievement_weights = {
+        name: float(weight)
+        for name, weight in zip(self._achievements, weights)}
+    if self._achievement_freeze:
+      self._weights_frozen = True
+
+  def _restore_stats(self):
+    if not self._logdir:
+      return
+    filename = self._logdir / 'stats.jsonl'
+    if not filename.exists():
+      return
+    for line in filename.read().splitlines():
+      try:
+        stats = json.loads(line)
+      except json.JSONDecodeError:
+        continue
+      if not all(
+          f'achievement_{name}' in stats for name in self._achievements):
+        continue
+      self._episode = max(self._episode, int(stats.get('episode', 0)))
+      self._completed_episodes += 1
+      for name in self._achievements:
+        self._achievement_successes[name] += int(
+            stats[f'achievement_{name}'] > 0)
+      self._update_achievement_weights()
+    if self._completed_episodes:
+      print(
+          f'Restored achievement statistics from {filename}: '
+          f'{self._completed_episodes} episodes')
+
   def _obs(
       self, image, reward, info,
-      is_first=False, is_last=False, is_terminal=False):
+      raw_reward=None, is_first=False, is_last=False, is_terminal=False):
+    raw_reward = reward if raw_reward is None else raw_reward
+    logged_reward = info['reward'] if info else raw_reward
     obs = dict(
         image=image,
         reward=np.float32(reward),
         is_first=is_first,
         is_last=is_last,
         is_terminal=is_terminal,
-        **{'log/reward': np.float32(info['reward'] if info else 0.0)},
+        **{
+            'log/reward': np.float32(logged_reward),
+            'log/train_reward': np.float32(reward),
+        },
     )
     if self._logs:
       log_achievements = {
@@ -79,12 +207,21 @@ class Crafter(embodied.Env):
       obs.update({k: np.int32(v) for k, v in log_achievements.items()})
     return obs
 
-  def _write_stats(self, length, reward, info):
+  def _write_stats(self, length, reward, train_reward, info, weights_used):
     stats = {
         'episode': self._episode,
         'length': length,
         'reward': round(reward, 1),
+        'train_reward': round(train_reward, 3),
+        'achievement_reweight': self._achievement_reweight,
         **{f'achievement_{k}': v for k, v in info['achievements'].items()},
+        **{
+            f'achievement_success_rate_{k}': round(
+                self._achievement_successes[k] / self._completed_episodes, 6)
+            for k in self._achievements},
+        **{
+            f'achievement_weight_{k}': round(weights_used[k], 6)
+            for k in self._achievements},
     }
     filename = self._logdir / 'stats.jsonl'
     lines = filename.read() if filename.exists() else ''
